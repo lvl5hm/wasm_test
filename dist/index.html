@@ -1,0 +1,256 @@
+<html>
+
+<head>
+  <script>if (!('WebAssembly' in window)) {
+  var msg = 'WebAssembly not supported';
+  alert(msg);
+  console.error(msg);
+}
+
+var c_memory = null;
+
+function loadWebAssembly(filename, imports) {
+  return fetch(filename).then(function (response) {
+    return response.arrayBuffer();
+  }).then(function (module) {
+    imports = imports || {};
+    imports.env = imports.env || {};
+
+    if (!imports.env.__linear_memory) {
+      // Setup our Memory import, initializing it
+      // to use 256 pages of memory.
+      imports.env.__linear_memory = new WebAssembly.Memory({
+        initial: 10000
+      });
+    }
+
+    if (!imports.env.__indirect_function_table) {
+      // Setup our Table with an inital size of 0,
+      // 'anyfunc' is currently the option here
+      imports.env.__indirect_function_table = new WebAssembly.Table({
+        initial: 0,
+        element: 'anyfunc'
+      });
+    }
+
+    var canvas = document.getElementById('canvas');
+    canvas.width = 600;
+    canvas.height = 400;
+    var gl = canvas.getContext('webgl2');
+
+    function createShader(gl, type, source) {
+      var shader = gl.createShader(type);
+      gl.shaderSource(shader, source);
+      gl.compileShader(shader);
+      var success = gl.getShaderParameter(shader, gl.COMPILE_STATUS);
+
+      if (success) {
+        return shader;
+      }
+
+      console.log(gl.getShaderInfoLog(shader));
+      gl.deleteShader(shader);
+    }
+
+    function createProgram(gl, vertexShader, fragmentShader) {
+      var program = gl.createProgram();
+      gl.attachShader(program, vertexShader);
+      gl.attachShader(program, fragmentShader);
+      gl.linkProgram(program);
+      var success = gl.getProgramParameter(program, gl.LINK_STATUS);
+
+      if (success) {
+        return program;
+      }
+
+      console.log(gl.getProgramInfoLog(program));
+      gl.deleteProgram(program);
+    }
+
+    function getStringFromC(offset) {
+      var length = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : 0;
+
+      if (length === 0) {
+        var dataView = new DataView(c_memory);
+
+        while (dataView.getUint8(offset + length) !== 0) {
+          length++;
+        }
+      }
+
+      var bytes = new Uint8Array(c_memory, offset, length);
+      var string = new TextDecoder('utf8').decode(bytes);
+      return string;
+    }
+
+    var shaderArray = [];
+
+    imports.env.gl_create_program = function (vertexStr, vertexLength, fragmentStr, fragmentLength) {
+      var shader = createProgram(gl, createShader(gl, gl.VERTEX_SHADER, getStringFromC(vertexStr, vertexLength)), createShader(gl, gl.FRAGMENT_SHADER, getStringFromC(fragmentStr, fragmentLength)));
+      var result = shaderArray.length;
+      shaderArray.push(shader);
+      return result;
+    };
+
+    imports.env.glClearColor = gl.clearColor.bind(gl);
+    imports.env.glClear = gl.clear.bind(gl);
+    var bufferArray = [];
+
+    imports.env.glGenBuffers = function (count, ptr) {
+      var ints = new Int32Array(c_memory, ptr, count);
+
+      for (var i = 0; i < count; i++) {
+        var index = bufferArray.length;
+        bufferArray.push(gl.createBuffer());
+        ints[i] = index;
+      }
+    };
+
+    window.gl = gl;
+    var textureArray = [];
+
+    imports.env.glGenTextures = function (count, ptr) {
+      var ints = new Int32Array(c_memory, ptr, count);
+
+      for (var i = 0; i < count; i++) {
+        var index = textureArray.length;
+        textureArray.push(gl.createTexture());
+        ints[i] = index;
+      }
+    };
+
+    imports.env.glTexParameteri = function (target, param, value) {
+      gl.texParameteri(target, param, value);
+    };
+
+    imports.env.glBindTexture = function (target, textureIndex) {
+      gl.bindTexture(target, textureArray[textureIndex]);
+    };
+
+    imports.env.glTexImage2D = function (target, level, internalformat, width, height, border, format, type, data) {
+      var view = new Uint8Array(c_memory, data, width * height * 4);
+      gl.texImage2D(target, level, internalformat, width, height, border, format, type, view);
+    };
+
+    imports.env.glBindBuffer = function (type, index) {
+      gl.bindBuffer(type, bufferArray[index]);
+    };
+
+    imports.env.glVertexAttribPointer = gl.vertexAttribPointer.bind(gl);
+    imports.env.glEnableVertexAttribArray = gl.enableVertexAttribArray.bind(gl);
+
+    imports.env.glBufferData = function (target, size, ptr, type) {
+      gl.bufferData(target, new Uint8Array(c_memory, ptr, size), type);
+    };
+
+    imports.env.glUseProgram = function (shaderIndex) {
+      gl.useProgram(shaderArray[shaderIndex]);
+    };
+
+    imports.env.glDrawArrays = gl.drawArrays.bind(gl);
+    var locationArray = [];
+
+    imports.env.glGetUniformLocation = function (shaderIndex, namePtr) {
+      var loc = gl.getUniformLocation(shaderArray[shaderIndex], getStringFromC(namePtr));
+      var result = locationArray.length;
+      locationArray.push(loc);
+      return result;
+    };
+
+    imports.env.glUniformMatrix4fv = function (location, count, transpose, value) {
+      for (var i = 0; i < count; i++) {
+        var m4size = 4 * 16;
+        var matrix = new Float32Array(c_memory, value + m4size * i, 16);
+        gl.uniformMatrix4fv(locationArray[location], transpose, matrix);
+      }
+    };
+
+    imports.env.js_print_number = function (num) {
+      console.log(num);
+    };
+
+    imports.env.js_print = function (offset, length) {
+      var string = getStringFromC(offset, length);
+      console.log(string);
+    };
+
+    imports.env.sinf = Math.sin;
+    imports.env.cosf = Math.cos;
+    imports.env.sqrt = Math.sqrt;
+    imports.env.atan2f = Math.atan2;
+    imports.env.roundf = Math.round;
+    fetch('./test.txt').then(function (res) {
+      return res.arrayBuffer();
+    }).then(console.log);
+
+    imports.env.js_http_request = function (endpointPtr, dstPtr, callback) {
+      fetch(endpointPtr).then(function (res) {
+        return res.arrayBuffer();
+      }).then(function (b) {
+        var src = new Uint8Array(b);
+        var dst = new Uint8Array(c_memory, dstPtr, b.byteLength);
+
+        for (var i = 0; i < b.byteLength; i++) {
+          dst[i] = src[i];
+        }
+      });
+    };
+
+    imports.env.js_load_image = function (srcStrPtr, dstPtr, widthPtr, heightPtr) {
+      var src = getStringFromC(srcStrPtr);
+      var image = new Image();
+      image.src = src;
+      var canvas = document.createElement('canvas');
+      var ctx = canvas.getContext('2d');
+
+      image.onload = function () {
+        canvas.width = image.width;
+        canvas.height = image.height;
+        ctx.drawImage(image, 0, 0);
+        var imageData = ctx.getImageData(0, 0, image.width, image.height);
+        var size = image.width * image.height * 4;
+        var dst = new Uint8Array(c_memory, dstPtr, size);
+
+        for (var i = 0; i < imageData.data.length; i++) {
+          dst[i] = imageData.data[i];
+        }
+
+        var widthBytes = new Uint32Array(c_memory, widthPtr, 1);
+        widthBytes[0] = image.width;
+        var heightBytes = new Uint32Array(c_memory, heightPtr, 1);
+        heightBytes[0] = image.height;
+      };
+    }; // Create a WebAssembly instance with our compiled
+    // module and pass in our import object
+
+
+    return WebAssembly.instantiate(module, imports);
+  });
+} // Call our load function.
+
+
+loadWebAssembly('main.wasm').then(function (instance) {
+  // Grab our exports and call our main function
+  var exports = instance.instance.exports;
+  exports.memory.grow(1000);
+  c_memory = exports.memory.buffer;
+  exports.main();
+  var prevTime = 0;
+
+  var loop = function loop() {
+    var time = performance.now();
+    var dt = (time - prevTime) / 1000;
+    prevTime = time;
+    exports.update(canvas.width, canvas.height, dt);
+    requestAnimationFrame(loop);
+  };
+
+  requestAnimationFrame(loop);
+});</script>
+</head>
+
+<body>
+  <canvas id="canvas">
+</canvas></body>
+
+</html>
